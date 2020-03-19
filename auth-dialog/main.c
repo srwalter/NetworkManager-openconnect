@@ -36,6 +36,8 @@
 #include <gtk/gtk.h>
 #include <glib-unix.h>
 
+#include <webkit2/webkit2.h>
+
 #include <gcr/gcr.h>
 
 #include <libsecret/secret.h>
@@ -626,6 +628,109 @@ static gboolean set_initial_authgroup (auth_ui_data *ui_data, struct oc_auth_for
 		}
 	}
 	return FALSE;
+}
+
+struct WebviewContext {
+	struct openconnect_info *vpninfo;
+	WebKitWebView *webview;
+	const char *login_uri;
+	GMutex mutex;
+	GCond cv;
+	int done;
+};
+
+static void cookie_cb (GObject *source_obj, GAsyncResult *res, gpointer data);
+
+static void load_changed_cb (WebKitWebView *web_view, WebKitLoadEvent load_event, struct WebviewContext *ctx)
+{
+	WebKitCookieManager *cm = webkit_web_context_get_cookie_manager(webkit_web_context_get_default());
+	const char *uri = webkit_web_view_get_uri(web_view);
+
+	if (load_event != WEBKIT_LOAD_FINISHED) {
+		return;
+	}
+
+	webkit_cookie_manager_get_cookies(cm, uri, NULL, cookie_cb, ctx);
+}
+
+static void cookie_cb (GObject *source_obj, GAsyncResult *res, gpointer data)
+{
+	struct WebviewContext *ctx = (struct WebviewContext *)data;
+	WebKitCookieManager *cm = webkit_web_context_get_cookie_manager(webkit_web_context_get_default());
+	GList *cookies, *l;
+	char **cookie_array;
+	int result, i, num_cookies = 0;
+	const char *uri = webkit_web_view_get_uri(ctx->webview);
+
+	cookies = webkit_cookie_manager_get_cookies_finish(cm, res, NULL);
+
+	for (l = cookies; l != NULL; l = l->next) {
+		num_cookies++;
+	}
+
+	cookie_array = malloc(2 * sizeof(char*) * (num_cookies+1));
+	memset(cookie_array, 0, 2 * sizeof(char*) * (num_cookies+1));
+
+	for (l = cookies, i = 0; l != NULL; l = l->next, i+=2) {
+		SoupCookie *cookie = (SoupCookie *)l->data;
+                cookie_array[i] = strdup(cookie->name);
+                cookie_array[i+1] = strdup(cookie->value);
+	}
+	g_list_free_full(cookies, (GDestroyNotify)soup_cookie_free);
+
+	result = openconnect_webview_load_changed(ctx->vpninfo, uri, (const char **)cookie_array, NULL);
+
+	for (i=0; i<num_cookies; i++) {
+		free(cookie_array[i]);
+	}
+	free(cookie_array);
+
+	if (!result) {
+		g_mutex_lock(&ctx->mutex);
+		ctx->done = 1;
+		g_cond_signal(&ctx->cv);
+		g_mutex_unlock(&ctx->mutex);
+	}
+}
+
+static gboolean open_webview_idle(gpointer data)
+{
+	struct WebviewContext *ctx = (struct WebviewContext *)data;
+	auth_ui_data *ui_data = _ui_data; /* FIXME global */
+	WebKitWebView *webView;
+
+	// Create a browser instance
+	webView = WEBKIT_WEB_VIEW(webkit_web_view_new());
+	g_signal_connect(webView, "load-changed", G_CALLBACK(load_changed_cb), ctx);
+	ctx->webview = webView;
+
+	// Put the browser area into the main window
+	gtk_widget_set_size_request(GTK_WIDGET(webView), 320, 240);
+	gtk_box_pack_start(GTK_BOX(ui_data->ssl_box), GTK_WIDGET(webView), FALSE, FALSE, 0);
+	gtk_widget_show_all(ui_data->ssl_box);
+
+	// Load a web page into the browser instance
+	webkit_web_view_load_uri(webView, ctx->login_uri);
+
+	return FALSE;
+}
+
+static void open_webview(struct openconnect_info *vpninfo, const char *login_uri)
+{
+	struct WebviewContext ctx;
+
+	ctx.vpninfo = vpninfo;
+	g_mutex_init(&ctx.mutex);
+	g_cond_init(&ctx.cv);
+	ctx.login_uri = login_uri;
+	ctx.done = 0;
+
+	g_mutex_lock(&ctx.mutex);
+	g_idle_add(open_webview_idle, &ctx);
+	while (!ctx.done) {
+		g_cond_wait(&ctx.cv, &ctx.mutex);
+	}
+	g_mutex_unlock(&ctx.mutex);
 }
 
 static int nm_process_auth_form (void *cbdata, struct oc_auth_form *form)
@@ -1652,6 +1757,8 @@ static auth_ui_data *init_ui_data (char *vpn_name, GHashTable *options, GHashTab
 							   validate_peer_cert, write_new_config,
 							   nm_process_auth_form, write_progress,
 							   ui_data);
+
+        openconnect_set_webview_callback(ui_data->vpninfo, open_webview);
 
 #if OPENCONNECT_CHECK_VER(1,4)
 	openconnect_set_cancel_fd (ui_data->vpninfo, ui_data->cancel_pipes[0]);

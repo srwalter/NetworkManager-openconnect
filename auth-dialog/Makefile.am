@@ -3,6 +3,7 @@ libexec_PROGRAMS = nm-openconnect-auth-dialog
 nm_openconnect_auth_dialog_CPPFLAGS = \
 	$(LIBNM_CFLAGS) \
 	$(GLIB_CFLAGS) \
+	$(WEBKIT_CFLAGS) \
 	$(GTK_CFLAGS) \
 	$(GCR_CFLAGS) \
 	$(OPENCONNECT_CFLAGS) \
@@ -20,6 +21,7 @@ nm_openconnect_auth_dialog_SOURCES = \
 
 nm_openconnect_auth_dialog_LDADD = \
 	$(GTK_LIBS) \
+	$(WEBKIT_LIBS) \
 	$(GCR_LIBS) \
 	$(LIBNM_LIBS) \
 	$(OPENCONNECT_LIBS) \
